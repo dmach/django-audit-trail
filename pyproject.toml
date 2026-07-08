@@ -1,0 +1,23 @@
+[project]
+name = "django-audit-trail"
+version = "0.1.0"
+description = "Transparent audit trail for Django models with queryable history and database-enforced integrity."
+readme = "README.md"
+authors = [
+    { name = "Daniel Mach", email = "daniel.mach@suse.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "django>=6.0",
+    "django-bolt>=0.9.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.25,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-django>=4.12.0",
+]
