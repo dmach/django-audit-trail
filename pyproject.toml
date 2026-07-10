@@ -20,6 +20,8 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
     "pytest-django>=4.12.0",
+    "pytest-postgresql",
+    "psycopg",
 ]
 
 [tool.pytest.ini_options]
@@ -27,3 +29,5 @@ DJANGO_SETTINGS_MODULE = "tests.settings"
 python_files = ["test_*.py"]
 testpaths = ["tests"]
 pythonpath = "."
+# set postgresql_exec to resolve 'Could not find pg_config executable' errors during testing
+postgresql_exec = "/usr/bin/pg_ctl"

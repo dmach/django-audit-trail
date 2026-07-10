@@ -10,8 +10,30 @@ the created user instances to the test database.
 """
 
 import pytest
-
 from django.contrib.auth import get_user_model
+
+
+@pytest.fixture(scope="session")
+def django_db_modify_db_settings(postgresql_proc):
+    """
+    Overriding django_db_modify_db_settings dynamically configures the database settings
+    just before Django initializes the connections, routing them to the ephemeral PostgreSQL.
+
+    PostgreSQL doesn't run under root for security reasons.
+    Dropping perms has issues, stick to running tests under an unprivileged user.
+    """
+    from django.conf import settings
+
+    settings.DATABASES["default"].update(
+        {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": postgresql_proc.dbname,
+            "USER": postgresql_proc.user,
+            "PASSWORD": postgresql_proc.password,
+            "HOST": postgresql_proc.host,
+            "PORT": postgresql_proc.port,
+        }
+    )
 
 
 @pytest.fixture
