@@ -1,5 +1,5 @@
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
 from django.db.models import Q
 from django.utils import timezone
 
@@ -35,3 +35,35 @@ class Event(models.Model):
     def __str__(self):
         username = self.user.get_username()
         return f"Event {self.id} at {self.timestamp} by {username}"
+
+
+class AuditTrailModel(models.Model):
+    """
+    Base class audited models.
+    """
+    created_event = models.ForeignKey(Event, on_delete=models.PROTECT, related_name="+")
+    revoked_event = models.ForeignKey(Event, on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args, **kwargs):
+        from .context import get_audit_trail_event
+
+        if not self.pk and self.created_event_id is None:
+            self.created_event = get_audit_trail_event()
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        from .context import get_audit_trail_event
+
+        event = get_audit_trail_event()
+        using = kwargs.get("using")
+
+        with transaction.atomic(using=using):
+            if self.revoked_event_id is not None:
+                # TODO: check how Django handles deleting already deleted objects
+                raise RuntimeError(f"{type(self).__name__} is already deleted.")
+
+            self.revoked_event = event
+            super().save(update_fields=["revoked_event"], using=using)

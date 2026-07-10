@@ -9,6 +9,7 @@ INSTALLED_APPS = [
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django_audit_trail",
+    "tests",
 ]
 
 DATABASES = {
