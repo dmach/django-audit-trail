@@ -37,12 +37,26 @@ class Event(models.Model):
         return f"Event {self.id} at {self.timestamp} by {username}"
 
 
+class AuditTrailManager(models.Manager):
+    """
+    Hides soft-deleted (revoked) entities.
+    """
+    def get_queryset(self):
+        return super().get_queryset().filter(revoked_event__isnull=True)
+
+
 class AuditTrailModel(models.Model):
     """
     Base class audited models.
     """
     created_event = models.ForeignKey(Event, on_delete=models.PROTECT, related_name="+")
     revoked_event = models.ForeignKey(Event, on_delete=models.PROTECT, null=True, blank=True, related_name="+")
+
+    # active objects only (without revoked)
+    objects = AuditTrailManager()
+
+    # all objects (with revoked)
+    all_objects = models.Manager()
 
     class Meta:
         abstract = True
