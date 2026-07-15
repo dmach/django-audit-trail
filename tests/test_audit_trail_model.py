@@ -521,6 +521,7 @@ def test_delete_pk_none_raises_value_error():
         pr.delete()
 
 
+@pytest.mark.filterwarnings("ignore:Error when trying to teardown test databases:pytest.PytestWarning")
 def test_state_unique_constraint_name_is_namespaced_by_app_label():
     """
     B6: The generated "one active state" unique constraint must be namespaced by

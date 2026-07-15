@@ -6,6 +6,8 @@ from django.utils.functional import cached_property
 from django.utils import timezone
 import typing
 
+from .context import get_time_travel_event, get_audit_trail_event, BEFORE_FIRST_EVENT
+
 
 class Event(models.Model):
     """
@@ -43,9 +45,30 @@ class Event(models.Model):
 class AuditTrailModelStateManager(models.Manager):
     """
     Manager for companion State tables that hides revoked entries.
+    Supports time travel when a time-travel context is active.
     """
     def get_queryset(self):
-        return super().get_queryset().filter(revoked_event__isnull=True)
+        # If accessed via a related manager, self.instance points to the parent anchor model.
+        instance = getattr(self, "instance", None)
+        event = getattr(instance, "_django_audit_trail_time_travel_event", None) if instance is not None else None
+        if event is None:
+            event = get_time_travel_event()
+
+        if event is None:
+            # Return the latest state.
+            return super().get_queryset().filter(revoked_event__isnull=True)
+
+        if event is BEFORE_FIRST_EVENT:
+            # Return an empty queryset when querying before the first Event.
+            return super().get_queryset().none()
+
+        # Return the state at the given event.
+        return (
+            super()
+            .get_queryset()
+            .filter(created_event_id__lte=event.id)
+            .filter(Q(revoked_event__isnull=True) | Q(revoked_event_id__gt=event.id))
+        )
 
 
 class AuditTrailModelState(models.Model):
@@ -151,6 +174,13 @@ class _AuditTrailStateField(property):
         # Class-level access (e.g. MyModel.title) returns the descriptor itself.
         if obj is None:
             return self
+
+        if obj.pk is not None and obj._loaded_state is None:
+            raise AttributeError(
+                f"Cannot access audited field '{self.attr_name}'. No state exists for "
+                f"this {obj._meta.object_name} at the requested point in time."
+            )
+
         return getattr(obj._draft_state, self.attr_name)
 
     def __set__(self, obj, value):
@@ -161,9 +191,38 @@ class _AuditTrailStateField(property):
 class AuditTrailManager(models.Manager):
     """
     Hides soft-deleted (revoked) entities.
+    Supports time travel when a time-travel context is active.
     """
     def get_queryset(self):
-        return super().get_queryset().filter(revoked_event__isnull=True)
+        event = get_time_travel_event()
+
+        if event is None:
+            # Return the latest state.
+            return super().get_queryset().filter(revoked_event__isnull=True)
+
+        if event is BEFORE_FIRST_EVENT:
+            # Return an empty queryset when querying before the first Event.
+            return super().get_queryset().none()
+
+        # Return the state at the given event.
+        return (
+            super()
+            .get_queryset()
+            .filter(created_event_id__lte=event.id)
+            .filter(Q(revoked_event__isnull=True) | Q(revoked_event_id__gt=event.id))
+        )
+
+
+class AuditTrailAllObjectsManager(models.Manager):
+    """
+    Manager that allows retrieving all anchor objects, but raises an exception
+    if accessed during an active time-travel context to prevent out-of-bounds
+    queries and preserve strict chronological isolation.
+    """
+    def get_queryset(self):
+        if get_time_travel_event() is not None:
+            raise ValidationError("Cannot query all_objects inside a time-travel context.")
+        return super().get_queryset()
 
 
 def _assert_event_not_stale(loaded_state, event):
@@ -181,6 +240,15 @@ def _assert_event_not_stale(loaded_state, event):
             f"{loaded_state.created_event.id} "
             f"({loaded_state.created_event.timestamp}) already exists."
         )
+
+
+def _assert_not_in_time_travel_mode(instance):
+    """
+    Prevents modifying or deleting models when a time-travel context is active,
+    or if the specific instance was loaded during time-travel.
+    """
+    if getattr(instance, "_django_audit_trail_time_travel_event", None) is not None or get_time_travel_event() is not None:
+        raise ValidationError("Cannot modify or delete models in time-travel mode.")
 
 
 class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
@@ -202,10 +270,16 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
     objects = AuditTrailManager()
 
     # All objects (including revoked).
-    all_objects = models.Manager()
+    all_objects = AuditTrailAllObjectsManager()
 
     class Meta:
         abstract = True
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        event = get_time_travel_event()
+        if event is not None:
+            self._django_audit_trail_time_travel_event = event
 
     @classmethod
     def from_db(cls, db, field_names, values):
@@ -214,6 +288,12 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
         # This allows us to detect which fields were modified in memory
         # and avoid overwriting concurrent database changes during save().
         instance.__dict__["_loaded_anchor"] = dict(zip(field_names, values))
+
+        # Capture the active time-travel point at load time.
+        event = get_time_travel_event()
+        if event is not None:
+            instance._django_audit_trail_time_travel_event = event
+
         return instance
 
     def lock(self, using=None) -> typing.Self:
@@ -272,10 +352,10 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
         Raises a `RuntimeError` if attempting to save a soft-deleted model.
         Raises a `ValidationError` if the event breaks the chronological audit timeline.
         """
+        _assert_not_in_time_travel_mode(self)
+
         if self.revoked_event_id is not None:
             raise RuntimeError(f"{self._meta.object_name} is already deleted.")
-
-        from .context import get_audit_trail_event
 
         event = get_audit_trail_event()
         using = kwargs.get("using")
@@ -409,10 +489,10 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
 
         Raises a `ValueError` if the instance is unsaved or has already been deleted in memory.
         """
+        _assert_not_in_time_travel_mode(self)
+
         if self.pk is None or getattr(self, "_deleted_in_memory", False):
             raise ValueError(f"{self._meta.object_name} object can't be deleted because its id attribute is set to None.")
-
-        from .context import get_audit_trail_event
 
         event = get_audit_trail_event()
         using = kwargs.get("using")

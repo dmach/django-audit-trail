@@ -107,6 +107,7 @@ def test_context_thread_safety(alice, bob):
         """
         Target function for Alice's thread context checks.
         """
+        from django.db import connections
         try:
             with pytest.raises(RuntimeError, match="No active audit trail event context"):
                 get_audit_trail_event()
@@ -119,11 +120,14 @@ def test_context_thread_safety(alice, bob):
                 get_audit_trail_event()
         except (AssertionError, Exception) as e:
             thread_errors.append(f"Alice thread error: {e}")
+        finally:
+            connections.close_all()
 
     def run_bob_thread():
         """
         Target function for Bob's thread context checks.
         """
+        from django.db import connections
         try:
             with pytest.raises(RuntimeError, match="No active audit trail event context"):
                 get_audit_trail_event()
@@ -136,6 +140,8 @@ def test_context_thread_safety(alice, bob):
                 get_audit_trail_event()
         except (AssertionError, Exception) as e:
             thread_errors.append(f"Bob thread error: {e}")
+        finally:
+            connections.close_all()
 
     thread1 = threading.Thread(target=run_alice_thread)
     thread2 = threading.Thread(target=run_bob_thread)

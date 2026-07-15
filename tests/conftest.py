@@ -36,6 +36,18 @@ def django_db_modify_db_settings(postgresql_proc):
     )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def close_db_connections_at_teardown():
+    """
+    Cleanly close all active Django database connections at the end of the test session.
+    This prevents 'database is being accessed by other users' warnings when pytest-postgresql
+    attempts to drop the test database during teardown.
+    """
+    yield
+    from django.db import connections
+    connections.close_all()
+
+
 @pytest.fixture
 def alice(db):
     User = get_user_model()
