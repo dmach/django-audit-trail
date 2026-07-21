@@ -7,7 +7,10 @@ from django.core.exceptions import ValidationError
 from django.utils import timezone
 from django_audit_trail.context import audit_trail_event, audit_trail_time_travel
 from django_audit_trail.models import Event
-from tests.models import PullRequest
+from tests.models import (
+    PullRequest, Tag, Article, ArticleTag,
+    Document, UnauditedCategory, Label, DocumentCategory, CategoryLabel
+)
 
 
 @pytest.mark.django_db
@@ -323,3 +326,129 @@ def test_time_travel_no_events_in_db():
         assert list(PullRequest.objects.all()) == []
 
 
+@pytest.mark.django_db
+def test_audited_m2m_relationships(alice):
+    """
+    Verify that Many-to-Many relationships built via an explicit through model
+    inheriting from AuditTrailModel are fully time-travel aware.
+    """
+    base_time = timezone.now()
+    t1 = base_time - timedelta(hours=3)
+    t2 = base_time - timedelta(hours=2)
+    t3 = base_time - timedelta(hours=1)
+
+    event_1 = Event.objects.create(user=alice, comment="Create Tag and Article", timestamp=t1)
+    event_2 = Event.objects.create(user=alice, comment="Link Tag to Article", timestamp=t2)
+    event_3 = Event.objects.create(user=alice, comment="Unlink Tag from Article", timestamp=t3)
+
+    # 1. Create Article & Tag
+    with audit_trail_event(event_1):
+        tag = Tag.objects.create(name="Django")
+        article = Article.objects.create(title="Audit Trail RFC")
+
+    # 2. Add tag to article
+    with audit_trail_event(event_2):
+        # We must create the explicit through model instance under the event
+        ArticleTag.objects.create(article=article, tag=tag)
+
+    # 3. Check tags under present context
+    assert list(article.tags.all()) == [tag]
+
+    # 4. Remove tag and change the tag's name!
+    with audit_trail_event(event_3):
+        # Soft-delete the through relation
+        ArticleTag.objects.get(article=article, tag=tag).delete()
+        # Mutate the tag's state
+        tag.name = "Django 6.0"
+        tag.save()
+
+    # 5. Outside time travel, relation should be gone
+    assert list(article.tags.all()) == []
+
+    # 6. Inside time travel to t2 (when linked), relation should be visible and name should be old!
+    with audit_trail_time_travel(t2):
+        tags_at_t2 = list(article.tags.all())
+        assert tags_at_t2 == [tag]
+        assert tags_at_t2[0].name == "Django"
+
+    # 7. Inside time travel to t1 (before link), relation should be gone!
+    with audit_trail_time_travel(t1):
+        assert list(article.tags.all()) == []
+
+    # 8. Verify prefetch_related also respects time-travel
+    with audit_trail_time_travel(t2):
+        prefetched_article = Article.objects.prefetch_related("tags").get(pk=article.pk)
+        assert list(prefetched_article.tags.all()) == [tag]
+
+    with audit_trail_time_travel(t1):
+        prefetched_article2 = Article.objects.prefetch_related("tags").get(pk=article.pk)
+        assert list(prefetched_article2.tags.all()) == []
+
+    # 9. Verify instance binding: accessing M2M outside the context on a historically loaded instance.
+    with audit_trail_time_travel(t2):
+        # Load the article as it was at t2 (tag was linked).
+        article_at_t2 = Article.objects.get(pk=article.pk)
+
+    # Exited context! We are in present day (tag is unlinked and its name is "Django 6.0").
+    # But querying M2M on this specific bound instance should still query as of t2.
+    out_of_context_tags = list(article_at_t2.tags.all())
+    assert out_of_context_tags == [tag]
+    # The loaded target instances MUST inherit the time-travel point of the source instance!
+    assert out_of_context_tags[0].name == "Django"
+
+
+@pytest.mark.django_db
+def test_time_travel_chained_m2m_through_unaudited(alice):
+    """
+    Verify that time-travel instance binding successfully propagates through
+    chained Many-to-Many relationships passing through an intermediate non-audited model:
+    Document (Audited) <-> UnauditedCategory (Unaudited) <-> Label (Audited).
+    """
+    base_time = timezone.now()
+    t1 = base_time - timedelta(hours=3)
+    t2 = base_time - timedelta(hours=2)
+    t3 = base_time - timedelta(hours=1)
+
+    event_1 = Event.objects.create(user=alice, comment="E1", timestamp=t1)
+    event_2 = Event.objects.create(user=alice, comment="E2", timestamp=t2)
+    event_3 = Event.objects.create(user=alice, comment="E3", timestamp=t3)
+
+    # 1. Create initial state at t1
+    with audit_trail_event(event_1):
+        doc = Document.objects.create(title="Doc V1")
+        cat = UnauditedCategory.objects.create(name="Cat V1")
+        label = Label.objects.create(text="Label V1")
+
+        # Link Document to Category, and Category to Label
+        DocumentCategory.objects.create(document=doc, category=cat)
+        CategoryLabel.objects.create(category=cat, label=label)
+
+    # 2. Mutate at t3 (sever link and change label text)
+    with audit_trail_event(event_3):
+        # Change label text
+        label.text = "Label V3"
+        label.save()
+
+        # Sever the connection between UnauditedCategory and Label
+        CategoryLabel.objects.get(category=cat, label=label).delete()
+
+    # Outside time-travel context (present):
+    # - Document is still connected to Category
+    assert list(doc.categories.all()) == [cat]
+    # - But Category's connection to Label is severed (M2M is empty)
+    assert list(cat.labels.all()) == []
+
+    # 3. Load Document as of t2 (inside context, then exit)
+    with audit_trail_time_travel(t2):
+        doc_t2 = Document.objects.get(pk=doc.pk)
+
+    # 4. Query chained M2M out of context!
+    # Doc (t2) -> Category. Should find cat.
+    categories = list(doc_t2.categories.all())
+    assert categories == [cat]
+
+    # Category should have inherited t2 from doc_t2, so:
+    # Category (t2) -> Label. Should find label, and it should have the old text "Label V1"!
+    labels = list(categories[0].labels.all())
+    assert labels == [label]
+    assert labels[0].text == "Label V1"

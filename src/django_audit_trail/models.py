@@ -2,6 +2,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.db.models import Q
+from django.db.models.fields.related_descriptors import ManyToManyDescriptor
 from django.utils.functional import cached_property
 from django.utils import timezone
 import typing
@@ -223,6 +224,76 @@ class AuditTrailAllObjectsManager(models.Manager):
         if get_time_travel_event() is not None:
             raise ValidationError("Cannot query all_objects inside a time-travel context.")
         return super().get_queryset()
+
+
+class AuditTrailManyToManyDescriptor(ManyToManyDescriptor):
+    """
+    Custom descriptor that explicitly replaces Django's default ManyToManyDescriptor
+    on models participating in audited relationships to filter out soft-deleted
+    relationships and respect the active time-travel context.
+    """
+    def __get__(self, instance, owner=None):
+        manager = super().__get__(instance, owner)
+        # Class-level access (e.g. MyModel.categories) returns the default manager.
+        if instance is None:
+            return manager
+
+        through = manager.through
+        if not issubclass(through, AuditTrailModel):
+            return manager
+
+        original_get_queryset = manager.get_queryset
+
+        def get_queryset():
+            qs = original_get_queryset()
+
+            # Find the relation query path from target model back to the through model.
+            target_field = through._meta.get_field(manager.target_field_name)
+            query_path = target_field.related_query_name()
+
+            # Retrieve active time-travel event
+            event = getattr(instance, "_django_audit_trail_time_travel_event", None)
+            if event is None:
+                event = get_time_travel_event()
+
+            if event is None:
+                # Standard view (exclude soft-deleted relationships).
+                revoked_null_filter = f"{query_path}__revoked_event__isnull"
+                return qs.filter(**{revoked_null_filter: True})
+
+            if event is BEFORE_FIRST_EVENT:
+                return qs.none()
+
+            # Apply time-travel filtering.
+            created_filter = f"{query_path}__created_event_id__lte"
+            revoked_null_filter = f"{query_path}__revoked_event__isnull"
+            revoked_gt_filter = f"{query_path}__revoked_event_id__gt"
+
+            qs = qs.filter(**{created_filter: event.id}).filter(
+                Q(**{revoked_null_filter: True}) | Q(**{revoked_gt_filter: event.id})
+            )
+
+            # Dynamically subclass the QuerySet to propagate the time-travel event
+            # to all instantiated target models upon execution/evaluation.
+            class AuditTrailContextPropagatingQuerySet(qs.__class__):
+                def _fetch_all(self):
+                    super()._fetch_all()
+                    if self._result_cache:
+                        for obj in self._result_cache:
+                            if isinstance(obj, models.Model) and getattr(obj, "_django_audit_trail_time_travel_event", None) is None:
+                                obj._django_audit_trail_time_travel_event = event
+
+                def iterator(self, *args, **kwargs):
+                    for obj in super().iterator(*args, **kwargs):
+                        if isinstance(obj, models.Model) and getattr(obj, "_django_audit_trail_time_travel_event", None) is None:
+                            obj._django_audit_trail_time_travel_event = event
+                        yield obj
+
+            qs.__class__ = AuditTrailContextPropagatingQuerySet
+            return qs
+
+        manager.get_queryset = get_queryset
+        return manager
 
 
 def _assert_event_not_stale(loaded_state, event):
