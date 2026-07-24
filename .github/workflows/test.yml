@@ -1,0 +1,54 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Django ${{ matrix.django-version }} / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14", "3.15"]
+        django-version: ["5.2", "6.0"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+
+      - name: Install PostgreSQL (Client and Server)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y postgresql-client postgresql
+          # Locate pg_ctl and symlink it to satisfy the hardcoded /usr/bin/pg_ctl in pyproject.toml
+          PG_CTL_PATH=$(find /usr/lib/postgresql/ -name pg_ctl | head -n 1)
+          if [ -n "$PG_CTL_PATH" ] && [ ! -f /usr/bin/pg_ctl ]; then
+            sudo ln -s "$PG_CTL_PATH" /usr/bin/pg_ctl
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Virtual Environment and Dependencies
+        run: |
+          # Sync using project settings
+          uv sync
+          # Explicitly override Django to test the targeted matrix version
+          uv pip install "django==${{ matrix.django-version }}.*"
+
+      - name: Run Test Suite
+        run: |
+          # Execute pytest via the standard Makefile shortcut
+          make test

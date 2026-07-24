@@ -14,7 +14,7 @@ Transparent, race-condition resilient audit trail for Django models with queryab
 
 ## Installation
 
-Ensure your project uses Django 6.0+ and Python 3.13+.
+Ensure your project uses Django 5.2+ and Python 3.12+.
 
 Add `django_audit_trail` to your `INSTALLED_APPS` in `settings.py`:
 

@@ -6,9 +6,9 @@ readme = "README.md"
 authors = [
     { name = "Daniel Mach", email = "daniel.mach@suse.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
-    "django>=6.0",
+    "django>=5.2",
     "django-bolt>=0.9.0",
 ]
 
