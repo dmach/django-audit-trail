@@ -105,3 +105,34 @@ class DocumentCategory(AuditTrailModel):
 
     class Meta:
         app_label = "tests"
+
+
+# --- Models for Testing Inherited Audited State ---
+
+class AbstractDocument(AuditTrailModel):
+    title = models.CharField(max_length=255)
+    author = models.CharField(max_length=100)
+
+    class State:
+        rating = models.IntegerField()
+
+    class Meta:
+        abstract = True
+        app_label = "tests"
+
+
+class BlogArticle(AbstractDocument):
+    url = models.URLField()
+
+    class Meta:
+        app_label = "tests"
+
+
+class Book(AbstractDocument):
+    isbn = models.CharField(max_length=20, unique=True)
+
+    class State:
+        price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    class Meta:
+        app_label = "tests"

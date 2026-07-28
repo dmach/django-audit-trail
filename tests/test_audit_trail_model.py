@@ -953,3 +953,158 @@ def test_partial_save_retains_unsaved_draft_changes(alice):
     assert pr._draft_state_dirty_fields == {"description"}
 
 
+@pytest.mark.django_db
+def test_abstract_model_state_inheritance(alice):
+    """
+    Ensure that an abstract AuditTrailModel with State does not get a state model
+    on its own, but a concrete subclass correctly inherits the State fields.
+    Also check that the inherited fields appear first, followed by the model's own fields (if any).
+    """
+    from tests.models import AbstractDocument, BlogArticle, Book
+
+    # AbstractDocument should not have been processed as usual (no state model).
+    assert not hasattr(AbstractDocument, "_state_model")
+
+    # BlogArticle should have a state model inheriting 'rating', but defining no state of its own.
+    assert hasattr(BlogArticle, "_state_model")
+    ArticleState = BlogArticle._state_model
+    internal_fields = {"id", "anchor", "created_event", "revoked_event"}
+    article_state_fields = [f.name for f in ArticleState._meta.fields if f.name not in internal_fields]
+    assert article_state_fields == ["rating"]
+
+    # Book should have a state model with 'rating' (inherited) first, and 'price' (own) second.
+    assert hasattr(Book, "_state_model")
+    BookState = Book._state_model
+    book_state_fields = [f.name for f in BookState._meta.fields if f.name not in internal_fields]
+    assert book_state_fields == ["rating", "price"]
+
+    # Verify functionality: creation, updating and history tracking works for BlogArticle.
+    event_create_article = Event.objects.create(user=alice, comment="Publish blog article")
+    with audit_trail_event(event_create_article):
+        article = BlogArticle.objects.create(
+            title="Django Audit Trail",
+            author="John Doe",
+            url="https://example.com/django-audit-trail",
+            rating=5,
+        )
+
+    assert article.title == "Django Audit Trail"
+    assert article.author == "John Doe"
+    assert article.url == "https://example.com/django-audit-trail"
+    assert article.rating == 5
+    assert article.created_event == event_create_article
+
+    # Verify functionality: creation, updating and history tracking works for Book.
+    event_create_book = Event.objects.create(user=alice, comment="Stock book")
+    with audit_trail_event(event_create_book):
+        book = Book.objects.create(
+            title="Two Years in the Wild",
+            author="Jane Doe",
+            isbn="978-3-16-148410-0",
+            rating=4,
+            price=19.99,
+        )
+
+    assert book.title == "Two Years in the Wild"
+    assert book.author == "Jane Doe"
+    assert book.isbn == "978-3-16-148410-0"
+    assert book.rating == 4
+    assert book.price == 19.99
+    assert book.created_event == event_create_book
+
+
+@pytest.mark.django_db
+def test_multiple_inheritance_raises_error():
+    """
+    Ensure that attempting to inherit from multiple audited models with states
+    raises a RuntimeError.
+    """
+    from django_audit_trail.models import AuditTrailModel
+    from django.db import models
+
+    class AbstractA(AuditTrailModel):
+        class State:
+            field_a = models.IntegerField()
+        class Meta:
+            abstract = True
+            app_label = "tests"
+
+    class AbstractB(AuditTrailModel):
+        class State:
+            field_b = models.IntegerField()
+        class Meta:
+            abstract = True
+            app_label = "tests"
+
+    with pytest.raises(RuntimeError, match="Multiple inheritance with audited states is not supported"):
+        type(
+            "MultipleStateDocument",
+            (AbstractA, AbstractB),
+            {
+                "__module__": "tests.models",
+                "Meta": type("Meta", (), {"app_label": "tests"}),
+            }
+        )
+
+
+@pytest.mark.django_db
+def test_inheritance_from_concrete_raises_error():
+    """
+    Ensure that attempting to inherit state from a concrete audited model
+    raises a RuntimeError.
+    """
+    from tests.models import Book
+    from django.db import models
+
+    with pytest.raises(RuntimeError, match="must inherit state from an abstract model, not Book"):
+        type(
+            "ConcreteSubclass",
+            (Book,),
+            {
+                "__module__": "tests.models",
+                "State": type("State", (), {"another_field": models.CharField(max_length=50)}),
+                "Meta": type("Meta", (), {"app_label": "tests"}),
+            }
+        )
+
+
+@pytest.mark.django_db
+def test_multilevel_inheritance_abstract_raises_error():
+    """
+    Ensure that attempting to inherit an abstract audited model from another
+    audited model raises a RuntimeError.
+    """
+    from tests.models import AbstractDocument
+    from django.db import models
+
+    with pytest.raises(RuntimeError, match="cannot inherit from another audited model. Multi-level inheritance is not supported"):
+        type(
+            "AbstractSubDocument",
+            (AbstractDocument,),
+            {
+                "__module__": "tests.models",
+                "State": type("State", (), {"stock_count": models.IntegerField()}),
+                "Meta": type("Meta", (), {"abstract": True, "app_label": "tests"}),
+            }
+        )
+
+
+@pytest.mark.django_db
+def test_state_attribute_must_be_class():
+    """
+    Ensure that defining a 'State' attribute that is not a class (e.g., a property or field)
+    raises a RuntimeError.
+    """
+    from django_audit_trail.models import AuditTrailModel
+    from django.db import models
+
+    with pytest.raises(RuntimeError, match="The 'State' attribute on BadStateModel must be a class"):
+        type(
+            "BadStateModel",
+            (AuditTrailModel,),
+            {
+                "__module__": "tests.models",
+                "State": models.CharField(max_length=20),
+                "Meta": type("Meta", (), {"app_label": "tests"}),
+            }
+        )

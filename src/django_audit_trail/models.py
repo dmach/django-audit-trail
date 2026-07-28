@@ -5,6 +5,7 @@ from django.db.models import Q
 from django.db.models.fields.related_descriptors import ManyToManyDescriptor
 from django.utils.functional import cached_property
 from django.utils import timezone
+import copy
 import typing
 
 from .context import get_time_travel_event, get_audit_trail_event, BEFORE_FIRST_EVENT
@@ -93,6 +94,18 @@ class AuditTrailModelState(models.Model):
         abstract = True
 
 
+def _clone_field(field):
+    """
+    Safely clones a Django field (including ForeignKeys) without calling .deconstruct()
+    to avoid AppRegistryNotReady errors at class import time.
+    """
+    cloned = copy.deepcopy(field)
+    # Assign a new creation_counter to preserve order.
+    cloned.creation_counter = models.Field.creation_counter
+    models.Field.creation_counter += 1
+    return cloned
+
+
 class AuditTrailMeta(models.base.ModelBase):
     """
     Metaclass that splits an audited model declaration into two parts:
@@ -104,16 +117,57 @@ class AuditTrailMeta(models.base.ModelBase):
     a nested `State` class are left unmodified.
     """
     def __new__(mcs, name, bases, namespace, **kwargs):
-        # Remove the nested State class from the model, as it has no use after the <Name>State model is generated.
-        nested_state_class = namespace.pop("State", None)
+        # Determine if the model is abstract before processing the namespace.
+        meta_class = namespace.get("Meta")
+        is_abstract = getattr(meta_class, "abstract", False) if meta_class is not None else False
+
+        if is_abstract:
+            # Keep the nested State class in abstract models.
+            nested_state_class = namespace.get("State", None)
+        else:
+            # Remove the nested State class from the model, as it has no use after the <Name>State model is generated.
+            nested_state_class = namespace.pop("State", None)
+
+        if nested_state_class is not None and not isinstance(nested_state_class, type):
+            raise RuntimeError(f"The 'State' attribute on {name} must be a class, got {type(nested_state_class).__name__}.")
+
         cls = super().__new__(mcs, name, bases, namespace, **kwargs)
 
-        if nested_state_class is None:
-            # If this is an abstract base (like AuditTrailModel) or has no State, there is nothing to wire.
+        audit_bases = [b for b in bases if isinstance(b, mcs) and (hasattr(b, "State") or hasattr(b, "_state_model"))]
+
+        if len(audit_bases) > 1:
+            raise RuntimeError(f"Multiple inheritance with audited states is not supported on {name}.")
+
+        if getattr(cls._meta, "abstract", False):
+            # Don't create 'ModelName>State' companion model for abstract models.
+            if audit_bases:
+                raise RuntimeError(f"Abstract model {name} cannot inherit from another audited model. Multi-level inheritance is not supported.")
             return cls
 
-        # Extract fields from the nested State class.
-        state_fields = {key: value for key, value in vars(nested_state_class).items() if isinstance(value, models.Field)}
+        state_fields = {}
+
+        if audit_bases:
+            # Inherit fields from nested State class of the abstract base model.
+            audit_base = audit_bases[0]
+            if not getattr(audit_base._meta, "abstract", False):
+                raise RuntimeError(f"Model {name} must inherit state from an abstract model, not {audit_base.__name__}.")
+
+            if hasattr(audit_base, "State"):
+                for key, value in vars(audit_base.State).items():
+                    if isinstance(value, models.Field):
+                        state_fields[key] = _clone_field(value)
+
+        # Copy fields from the nested State class.
+        if nested_state_class is not None:
+            for key, value in vars(nested_state_class).items():
+                if isinstance(value, models.Field):
+                    # We could assign `value` directly since these are the model's own fields.
+                    # However, cloning them through `_clone_field` assigns fresh, sequential
+                    # creation_counters, guaranteeing they order after any inherited fields.
+                    state_fields[key] = _clone_field(value)
+
+        if not state_fields:
+            return cls
 
         # Dynamically create the <Name>State companion model.
         State = type(
