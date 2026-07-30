@@ -484,7 +484,9 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
 
         event = get_audit_trail_event()
         using = kwargs.get("using")
-        update_fields = kwargs.get("update_fields")
+
+        if kwargs.get("update_fields") is not None:
+            raise ValueError("update_fields is not supported by django_audit_trail")
 
         # Use _state.adding to reliably detect an insert. Relying on self.pk
         # is unsafe for models with explicit or UUID primary keys.
@@ -498,29 +500,11 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
             super().save(*args, **kwargs)
             return
 
-        # Categorize the fields being saved. We strip state fields out of 
-        # kwargs["update_fields"] so Django's native save() doesn't fail.
-        if update_fields is None:
-            should_save_anchor = True
-            should_save_state = is_new or bool(self._draft_state_dirty_fields)
-            state_update_fields = None
-            requested_state_cols = None
-        else:
-            anchor_update_fields = [f for f in update_fields if f in self._anchor_fields_set]
-            state_update_fields = [f for f in update_fields if f in self._state_fields_set]
-            kwargs["update_fields"] = anchor_update_fields
-
-            should_save_anchor = is_new or bool(anchor_update_fields)
-            requested_state_cols = {
-                f.attname for f in self._state_data_fields_list
-                if f.name in state_update_fields or f.attname in state_update_fields
-            }
-            should_save_state = is_new or bool(requested_state_cols & self._draft_state_dirty_fields)
+        should_save_state = is_new or bool(self._draft_state_dirty_fields)
 
         # If no state fields were modified, just save the anchor and exit.
         if not should_save_state:
-            if should_save_anchor:
-                super().save(*args, **kwargs)
+            super().save(*args, **kwargs)
             return
 
         # Note: If the transaction fails, the database rolls back, but the in-memory 
@@ -553,20 +537,19 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
 
             # Persist the anchor. We strictly write only the fields changed in this process
             # (based on the loaded snapshot) to avoid overwriting concurrent updates.
-            if should_save_anchor:
-                if is_new or update_fields is not None:
-                    super().save(*args, **kwargs)
+            if is_new:
+                super().save(*args, **kwargs)
+            else:
+                auto_now = self._auto_now_fields
+                loaded = self.__dict__.get("_loaded_anchor")
+                if loaded is None:
+                    # Object was built in memory, not loaded. Safely update auto_now fields only.
+                    changed = auto_now
                 else:
-                    auto_now = self._auto_now_fields
-                    loaded = self.__dict__.get("_loaded_anchor")
-                    if loaded is None:
-                        # Object was built in memory, not loaded. Safely update auto_now fields only.
-                        changed = auto_now
-                    else:
-                        changed = [f.attname for f in self._meta.concrete_fields if f.attname in loaded and getattr(self, f.attname) != loaded[f.attname]]
-                    changed = list(set(changed).union(auto_now))
-                    if changed:
-                        super().save(update_fields=changed, using=using)
+                    changed = [f.attname for f in self._meta.concrete_fields if f.attname in loaded and getattr(self, f.attname) != loaded[f.attname]]
+                changed = list(set(changed).union(auto_now))
+                if changed:
+                    super().save(update_fields=changed, using=using)
 
             if current is None:
                 current = self._loaded_state
@@ -575,8 +558,7 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
             # fields are copied from the freshly-locked database row to prevent data loss.
             new_values = {}
             for f in self._state_data_fields_list:
-                write_this = state_update_fields is None or f.attname in requested_state_cols
-                if write_this and f.attname in self._draft_state_dirty_fields:
+                if f.attname in self._draft_state_dirty_fields:
                     new_values[f.attname] = getattr(self._draft_state, f.attname)
                 elif current is not None:
                     new_values[f.attname] = getattr(current, f.attname)
@@ -595,14 +577,9 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
             # state, and selectively clean up the draft and dirty trackers.
             self.__dict__["_loaded_state"] = new_state
 
-            if state_update_fields is None:
-                # Full save: Discard the draft and the dirty fields set completely.
-                self.__dict__.pop("_draft_state_cache", None)
-                self.__dict__.pop("_draft_state_dirty_fields_set", None)
-            else:
-                # Partial save (update_fields): Keep the draft alive because it may
-                # contain unsaved changes for other fields. Only clear the saved fields.
-                self._draft_state_dirty_fields.difference_update(requested_state_cols)
+            # Discard the draft and the dirty fields set.
+            self.__dict__.pop("_draft_state_cache", None)
+            self.__dict__.pop("_draft_state_dirty_fields_set", None)
             self.__dict__["_loaded_anchor"] = {
                 f.attname: getattr(self, f.attname) for f in self._meta.concrete_fields
             }
