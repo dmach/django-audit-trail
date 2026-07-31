@@ -812,13 +812,12 @@ def test_state_update_does_not_clobber_concurrent_anchor_field(alice, bob):
     C1: A pure state update must not rewrite unrelated anchor fields with stale
     in-memory values.
 
-    Otherwise a concurrent in-place anchor update (e.g. an ephemeral lock flag
-    or, here, `owner`) performed by another process is silently clobbered when
-    this process saves an unrelated *state* field.
+    Otherwise a concurrent in-place anchor update (performed via QuerySet.update())
+    by another process is silently clobbered when this process saves an unrelated
+    *state* field.
     """
     event1 = Event.objects.create(user=alice, comment="Initial")
-    event2 = Event.objects.create(user=bob, comment="Concurrent anchor update")
-    event3 = Event.objects.create(user=alice, comment="State update")
+    event2 = Event.objects.create(user=alice, comment="State update")
 
     with audit_trail_event(event1):
         pr = PullRequest.objects.create(
@@ -832,14 +831,11 @@ def test_state_update_does_not_clobber_concurrent_anchor_field(alice, bob):
     pr_a = PullRequest.objects.get(pk=pr.pk)
     _ = pr_a.title  # Populate state cache.
 
-    # Process B updates an anchor field in place and saves it.
-    pr_b = PullRequest.objects.get(pk=pr.pk)
-    with audit_trail_event(event2):
-        pr_b.owner = "new-owner"
-        pr_b.save()
+    # Process B updates an anchor field in place using QuerySet.update().
+    PullRequest.objects.filter(pk=pr.pk).update(owner="new-owner")
 
     # Process A updates only a STATE field.
-    with audit_trail_event(event3):
+    with audit_trail_event(event2):
         pr_a.title = "Updated by A"
         pr_a.save()
 
@@ -850,12 +846,11 @@ def test_state_update_does_not_clobber_concurrent_anchor_field(alice, bob):
 
 
 @pytest.mark.django_db
-def test_combined_anchor_and_state_change_persists_both(alice, bob):
+def test_combined_anchor_and_state_change_raises_error(alice, bob):
     """
-    Transparency: saving persists BOTH a changed anchor field and a changed
-    state field, exactly like a normal Django model save. Anchor dirty-tracking
-    detects the changed anchor column and writes it (alongside auto_now columns)
-    without clobbering concurrent anchor updates.
+    Ensure that trying to modify an anchor field and a state field together
+    and calling save() raises a ValueError, because anchor fields are strictly
+    read-only after creation.
     """
     event1 = Event.objects.create(user=alice, comment="Initial")
     event2 = Event.objects.create(user=bob, comment="Combined update")
@@ -872,11 +867,8 @@ def test_combined_anchor_and_state_change_persists_both(alice, bob):
     with audit_trail_event(event2):
         pr2.owner = "changed-owner"  # Anchor field.
         pr2.title = "Changed Title"  # State field.
-        pr2.save()
-
-    pr_final = PullRequest.objects.get(pk=pr.pk)
-    assert pr_final.owner == "changed-owner"
-    assert pr_final.title == "Changed Title"
+        with pytest.raises(ValueError, match="Cannot modify anchor field 'owner'"):
+            pr2.save()
 
 
 @pytest.mark.django_db
@@ -1068,3 +1060,69 @@ def test_refresh_from_db_clears_state_cache(alice, bob):
 
     # 5. Verify that the refreshed instance returns the updated title
     assert pr.title == "Updated Title Externally"
+
+
+@pytest.mark.django_db
+def test_anchor_fields_are_strictly_read_only(alice):
+    """
+    Ensure that anchor fields are strictly read-only after creation,
+    and attempting to modify them raises a ValueError.
+    """
+    from tests.models import Article, Tag, ArticleTag
+
+    event = Event.objects.create(user=alice, comment="Creation")
+
+    with audit_trail_event(event):
+        pr = PullRequest.objects.create(
+            owner="octocat",
+            repo="hello-world",
+            number=1,
+            title="Initial Title",
+        )
+
+    # Modifying 'number' (anchor field) should fail
+    pr.number = 2
+    with pytest.raises(ValueError, match="Cannot modify anchor field 'number'"):
+        with audit_trail_event(event):
+            pr.save()
+
+    # Modifying 'owner' (anchor field) should also fail now
+    pr.number = 1  # restore
+    pr.owner = "new-owner"
+    with pytest.raises(ValueError, match="Cannot modify anchor field 'owner'"):
+        with audit_trail_event(event):
+            pr.save()
+
+    # Modifying 'created_event' (critical audit field) should fail
+    pr.owner = "octocat"  # restore
+    pr.created_event = Event.objects.create(user=alice, comment="Tampered Event")
+    with pytest.raises(ValueError, match="Cannot modify anchor field 'created_event'"):
+        with audit_trail_event(event):
+            pr.save()
+
+    # Modifying 'revoked_event' (critical audit field) should fail
+    pr.created_event = event  # restore
+    pr.revoked_event = Event.objects.create(user=alice, comment="Tampered Event")
+    with pytest.raises(RuntimeError, match="PullRequest is already deleted"):
+        with audit_trail_event(event):
+            pr.save()
+
+    # Modifying 'id' (primary key) should fail
+    pr.revoked_event = None  # restore
+    pr.id = 99999
+    with pytest.raises(ValueError, match="Cannot modify anchor field 'id'"):
+        with audit_trail_event(event):
+            pr.save()
+
+    # 2. Test model without State (ArticleTag)
+    with audit_trail_event(event):
+        article1 = Article.objects.create(title="Article 1")
+        article2 = Article.objects.create(title="Article 2")
+        tag = Tag.objects.create(name="tag-1")
+        link = ArticleTag.objects.create(article=article1, tag=tag)
+
+    # Modifying 'article' (anchor field on model without State) should fail
+    link.article = article2
+    with pytest.raises(ValueError, match="Cannot modify anchor field 'article'"):
+        with audit_trail_event(event):
+            link.save()

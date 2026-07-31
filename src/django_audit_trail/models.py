@@ -117,8 +117,9 @@ class AuditTrailMeta(models.base.ModelBase):
     a nested `State` class are left unmodified.
     """
     def __new__(mcs, name, bases, namespace, **kwargs):
-        # Determine if the model is abstract before processing the namespace.
         meta_class = namespace.get("Meta")
+
+        # Determine if the model is abstract before processing the namespace.
         is_abstract = getattr(meta_class, "abstract", False) if meta_class is not None else False
 
         if is_abstract:
@@ -432,6 +433,38 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
             raise ValueError(f"Cannot lock an unsaved {self._meta.object_name} object.")
         return self.__class__.all_objects.using(using).select_for_update().get(pk=self.pk)
 
+    def _lock_and_verify_anchor(self, using=None) -> typing.Self:
+        """
+        Acquires a row-level lock on the anchor, verifies it is not soft-deleted,
+        and ensures that no strictly read-only anchor fields have been modified in memory.
+        """
+        # Check if the primary key was modified in memory before locking.
+        # This prevents DoesNotExist errors if the new PK doesn't exist in the DB,
+        # and ensures we always raise a clear ValueError.
+        loaded = self.__dict__.get("_loaded_anchor")
+        if loaded is not None:
+            pk_field = self._meta.pk
+            if getattr(self, pk_field.attname) != loaded.get(pk_field.attname):
+                raise ValueError(
+                    f"Cannot modify anchor field '{pk_field.name}' on existing {self._meta.object_name}. "
+                    f"Anchor fields are strictly read-only after creation."
+                )
+
+        locked_anchor = self.lock(using=using)
+        if locked_anchor.revoked_event_id is not None:
+            raise RuntimeError(f"{self._meta.object_name} is already deleted.")
+
+        for f in self._meta.concrete_fields:
+            if getattr(f, "auto_now", False):
+                continue
+            expected_val = loaded.get(f.attname) if loaded is not None else getattr(locked_anchor, f.attname)
+            if getattr(self, f.attname) != expected_val:
+                raise ValueError(
+                    f"Cannot modify anchor field '{f.name}' on existing {self._meta.object_name}. "
+                    f"Anchor fields are strictly read-only after creation."
+                )
+        return locked_anchor
+
     @property
     def _draft_state(self):
         """
@@ -497,14 +530,38 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
         if not hasattr(self, "_state_model"):
             if is_new and self.created_event_id is None:
                 self.created_event = event
-            super().save(*args, **kwargs)
+            if not is_new:
+                self._lock_and_verify_anchor(using=using)
+                auto_now = self._auto_now_fields
+                if auto_now:
+                    super().save(update_fields=auto_now, using=using)
+            else:
+                super().save(*args, **kwargs)
+            # Update the in-memory snapshot to match the newly saved database state.
+            # This pulls in database-generated values (like PKs for new objects) and
+            # updated auto_now timestamps, ensuring subsequent save() calls on this
+            # instance have an accurate baseline for immutability checks.
+            self.__dict__["_loaded_anchor"] = {
+                f.attname: getattr(self, f.attname) for f in self._meta.concrete_fields
+            }
             return
 
         should_save_state = is_new or bool(self._draft_state_dirty_fields)
 
         # If no state fields were modified, just save the anchor and exit.
         if not should_save_state:
-            super().save(*args, **kwargs)
+            if not is_new:
+                self._lock_and_verify_anchor(using=using)
+                auto_now = self._auto_now_fields
+                if auto_now:
+                    super().save(update_fields=auto_now, using=using)
+            # Update the in-memory snapshot to match the newly saved database state.
+            # This pulls in database-generated values (like PKs for new objects) and
+            # updated auto_now timestamps, ensuring subsequent save() calls on this
+            # instance have an accurate baseline for immutability checks.
+            self.__dict__["_loaded_anchor"] = {
+                f.attname: getattr(self, f.attname) for f in self._meta.concrete_fields
+            }
             return
 
         # Note: If the transaction fails, the database rolls back, but the in-memory 
@@ -520,9 +577,8 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
             # and unique database constraints.)
             current = None
             if not is_new and self.pk is not None:
-                locked_anchor = self.lock(using=using)
-                if locked_anchor.revoked_event_id is not None:
-                    raise RuntimeError(f"{self._meta.object_name} is already deleted.")
+                self._lock_and_verify_anchor(using=using)
+
                 # Drop any cached _loaded_state to ensure we read the fresh row.
                 self.__dict__.pop("_loaded_state", None)
                 # Use select_related on created_event to make the late-arrival check query-free.
@@ -535,21 +591,13 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
                 # Block late arrivals under the lock, before performing any writes.
                 _assert_event_not_stale(current, event)
 
-            # Persist the anchor. We strictly write only the fields changed in this process
-            # (based on the loaded snapshot) to avoid overwriting concurrent updates.
+            # Persist the anchor.
             if is_new:
                 super().save(*args, **kwargs)
             else:
                 auto_now = self._auto_now_fields
-                loaded = self.__dict__.get("_loaded_anchor")
-                if loaded is None:
-                    # Object was built in memory, not loaded. Safely update auto_now fields only.
-                    changed = auto_now
-                else:
-                    changed = [f.attname for f in self._meta.concrete_fields if f.attname in loaded and getattr(self, f.attname) != loaded[f.attname]]
-                changed = list(set(changed).union(auto_now))
-                if changed:
-                    super().save(update_fields=changed, using=using)
+                if auto_now:
+                    super().save(update_fields=auto_now, using=using)
 
             if current is None:
                 current = self._loaded_state
@@ -580,6 +628,11 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
             # Discard the draft and the dirty fields set.
             self.__dict__.pop("_draft_state_cache", None)
             self.__dict__.pop("_draft_state_dirty_fields_set", None)
+
+            # Update the in-memory snapshot to match the newly saved database state.
+            # This pulls in database-generated values (like PKs for new objects) and
+            # updated auto_now timestamps, ensuring subsequent save() calls on this
+            # instance have an accurate baseline for immutability checks.
             self.__dict__["_loaded_anchor"] = {
                 f.attname: getattr(self, f.attname) for f in self._meta.concrete_fields
             }
