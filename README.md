@@ -234,6 +234,51 @@ To maintain strict data integrity, guard against race conditions, and keep the s
 
 ---
 
+## Immutable Anchor Fields
+
+To maintain strict data integrity and prevent silent tampering with an object's identity or core relationships,
+**all anchor fields (fields defined outside the nested `State` class) are strictly read-only after creation.**
+
+If you attempt to modify an anchor field on an existing instance and call `.save()`, a `ValueError` will be raised.
+
+### Handling Mutable Non-Audited Data
+
+If you need to work with mutable data that does not belong in the audit trail (such as view counters,
+cache hashes, or synchronization statuses), we recommend using one of the following two patterns:
+
+#### 1. Separate 1:1 Model (Recommended)
+Create a standard, non-audited Django model linked to your anchor model via a `OneToOneField`.
+This keeps your anchor model strictly read-only, prevents database lock contention on the anchor, and keeps the audit trail clean.
+
+```python
+class Article(AuditTrailModel):
+    slug = models.SlugField(unique=True)  # Strictly read-only identity
+
+    class State:
+        title = models.CharField(max_length=200)  # Audited data
+
+class ArticleMetrics(models.Model):
+    # Use DO_NOTHING to preserve metrics even if the Article is soft-deleted.
+    article = models.OneToOneField(Article, on_delete=models.DO_NOTHING, related_name="metrics")
+    view_count = models.IntegerField(default=0)
+    last_accessed = models.DateTimeField(auto_now=True)
+```
+
+#### 2. Direct Database Updates (`QuerySet.update()`)
+If you prefer to keep the fields on the same table, you can update them directly in the database using `QuerySet.update()`.
+This bypasses the in-memory instance `save()` machinery and does not trigger the audit trail.
+
+```python
+from django.db.models import F
+
+# This is atomic and does not load the instance into memory
+Article.objects.filter(pk=article.pk).update(view_count=F("view_count") + 1)
+```
+
+*Note: Internal fields like `id`, `created_event`, `revoked_event`, and fields with `auto_now=True` are handled automatically and are exempt from the read-only restriction.*
+
+---
+
 ## Unsupported Features
 
 - **`save(update_fields=...)`**: Passing `update_fields` to the `save()` method is explicitly not supported and will raise a `ValueError`.
