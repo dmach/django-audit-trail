@@ -1034,3 +1034,37 @@ def test_state_attribute_must_be_class():
                 "Meta": type("Meta", (), {"app_label": "tests"}),
             }
         )
+
+
+@pytest.mark.django_db
+def test_refresh_from_db_clears_state_cache(alice, bob):
+    """
+    Ensure that calling refresh_from_db() clears all custom state caches,
+    allowing the instance to correctly reflect external database updates.
+    """
+    event1 = Event.objects.create(user=alice, comment="Initial")
+    event2 = Event.objects.create(user=bob, comment="External update")
+
+    # 1. Create the initial object
+    with audit_trail_event(event1):
+        pr = PullRequest.objects.create(
+            owner="octocat",
+            repo="hello-world",
+            number=1,
+            title="Initial Title",
+        )
+
+    # 2. Load it into memory (caches are populated upon access)
+    assert pr.title == "Initial Title"
+
+    # 3. Update the object in the database via a separate instance
+    pr_external = PullRequest.objects.get(pk=pr.pk)
+    with audit_trail_event(event2):
+        pr_external.title = "Updated Title Externally"
+        pr_external.save()
+
+    # 4. Refresh the original instance from the database
+    pr.refresh_from_db()
+
+    # 5. Verify that the refreshed instance returns the updated title
+    assert pr.title == "Updated Title Externally"

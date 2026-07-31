@@ -584,6 +584,18 @@ class AuditTrailModel(models.Model, metaclass=AuditTrailMeta):
                 f.attname: getattr(self, f.attname) for f in self._meta.concrete_fields
             }
 
+    def refresh_from_db(self, using=None, fields=None):
+        """
+        Reloads the instance from the database and clears all internal state caches.
+        """
+        super().refresh_from_db(using=using, fields=fields)
+
+        # Clear internal state caches so they are re-fetched on next access
+        self.__dict__.pop("_loaded_state", None)
+        self.__dict__.pop("_draft_state_cache", None)
+        self.__dict__.pop("_draft_state_dirty_fields_set", None)
+        self.__dict__.pop("_loaded_anchor", None)
+
     def delete(self, *args, **kwargs):
         """
         Soft-deletes the instance by marking it as revoked.
