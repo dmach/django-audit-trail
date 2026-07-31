@@ -60,14 +60,14 @@ This models the "Who, When, Where, Why" of your changes (the 5Ws).
 from django_audit_trail.context import audit_trail_event
 from django_audit_trail.models import Event
 
-# 1. Create an audit event (representing a transaction boundary)
-event = Event.objects.create(
+# 1. Create an unsaved audit event
+event = Event(
     user=request.user,
     comment="Publishing first version",
     http_request_id="unique-request-uuid",
 )
 
-# 2. Perform operations inside the context
+# 2. Perform operations inside the context. The event is saved automatically inside the transaction.
 with audit_trail_event(event):
     # Create
     article = Article.objects.create(
@@ -101,7 +101,7 @@ for state in history:
 Calling `.delete()` soft-deletes the entity by assigning a `revoked_event` under the hood.
 
 ```python
-delete_event = Event.objects.create(user=request.user, comment="Removing spam article")
+delete_event = Event(user=request.user, comment="Removing spam article")
 
 with audit_trail_event(delete_event):
     article.delete()

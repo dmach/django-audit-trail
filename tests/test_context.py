@@ -157,7 +157,7 @@ def test_context_thread_safety(alice, bob):
 
 
 @pytest.mark.django_db
-def test_context_async_task_isolation(alice, bob):
+def test_context_async_task_isolation(alice, bob, monkeypatch):
     """
     B5: The event context must be isolated between concurrent asyncio tasks
     running on the same thread.
@@ -166,6 +166,8 @@ def test_context_async_task_isolation(alice, bob):
     tasks clobber each other's context (a leak). contextvars gives each task its
     own copied context, keeping them isolated.
     """
+    monkeypatch.setenv("DJANGO_ALLOW_ASYNC_UNSAFE", "true")
+
     event_alice = Event.objects.create(user=alice, comment="Alice event")
     event_bob = Event.objects.create(user=bob, comment="Bob event")
 
@@ -189,3 +191,84 @@ def test_context_async_task_isolation(alice, bob):
     # Each task must observe only its own event.
     assert results["alice"] == event_alice
     assert results["bob"] == event_bob
+
+
+@pytest.mark.django_db
+def test_unsaved_event_saved_automatically(alice):
+    """
+    Ensure that passing an unsaved Event instance to audit_trail_event
+    saves it automatically inside the transaction.
+    """
+    from tests.models import PullRequest
+
+    event = Event(user=alice, comment="Unsaved event")
+    assert event.pk is None
+
+    with audit_trail_event(event):
+        assert event.pk is not None
+        pr = PullRequest.objects.create(
+            owner="octocat",
+            repo="hello-world",
+            number=1,
+            title="Original Title",
+        )
+
+    assert PullRequest.objects.count() == 1
+    assert Event.objects.filter(comment="Unsaved event").count() == 1
+
+
+@pytest.mark.django_db
+def test_unsaved_event_rollback_on_failure(alice):
+    """
+    Ensure that if an error occurs inside the context, the unsaved Event
+    creation is rolled back along with any other mutations.
+    """
+    from tests.models import PullRequest
+
+    event = Event(user=alice, comment="Unsaved event to be rolled back")
+    assert event.pk is None
+
+    with pytest.raises(ValueError, match="Rollback!"):
+        with audit_trail_event(event):
+            PullRequest.objects.create(
+                owner="octocat",
+                repo="hello-world",
+                number=1,
+                title="Original Title",
+            )
+            raise ValueError("Rollback!")
+
+    # Both the event and the PullRequest should be rolled back
+    assert Event.objects.filter(comment="Unsaved event to be rolled back").count() == 0
+    assert PullRequest.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_transaction_boundary_rolls_back_mutations(alice):
+    """
+    Ensure that audit_trail_event acts as a transaction boundary,
+    rolling back all mutations inside the block if an exception is raised.
+    """
+    from tests.models import PullRequest
+
+    event = Event.objects.create(user=alice, comment="Transaction boundary event")
+
+    with pytest.raises(ValueError, match="Rollback!"):
+        with audit_trail_event(event):
+            PullRequest.objects.create(
+                owner="octocat",
+                repo="hello-world",
+                number=1,
+                title="PR 1",
+            )
+            PullRequest.objects.create(
+                owner="octocat",
+                repo="hello-world",
+                number=2,
+                title="PR 2",
+            )
+            raise ValueError("Rollback!")
+
+    # No PullRequests should have been saved
+    assert PullRequest.objects.count() == 0
+

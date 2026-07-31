@@ -33,12 +33,22 @@ _time_travel_event = contextvars.ContextVar(
 def audit_trail_event(event):
     """
     Context manager to implicitly pass the current Event to save/delete operations.
+    It wraps the block in a database transaction to ensure all mutations are applied atomically.
+    If an unsaved Event instance is passed, it will be saved within this transaction,
+    preventing orphan events if the block fails.
     """
-    token = _current_event.set(event)
-    try:
-        yield
-    finally:
-        _current_event.reset(token)
+    from django.db import transaction
+
+    using = event._state.db or "default"
+    with transaction.atomic(using=using):
+        if event.pk is None:
+            event.save(using=using)
+
+        token = _current_event.set(event)
+        try:
+            yield
+        finally:
+            _current_event.reset(token)
 
 
 def get_audit_trail_event():
