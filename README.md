@@ -189,3 +189,46 @@ print(historic_tags[0].name)
 **Unaudited Models:** This propagation is so robust that it successfully navigates through standard, non-audited Django models.
 For example, in a chain like `Document (Audited)` -> `UnauditedCategory (Unaudited)` -> `Label (Audited)`,
 resolving labels from a historically bound document will yield historically correct labels, seamlessly bypassing the "blind spot" of the unaudited category model!
+
+### 7. State Inheritance and Abstract Models
+
+`django_audit_trail` supports inheriting audited state fields from abstract base models.
+This allows sharing common audit structures across multiple concrete models,
+and supports both adding additional subclass-specific states and purely inheriting without adding new states.
+
+```python
+from django.db import models
+from django_audit_trail.models import AuditTrailModel
+
+class AbstractDocument(AuditTrailModel):
+    # Anchor fields (identity - never change)
+    title = models.CharField(max_length=255)
+    author = models.CharField(max_length=100)
+
+    class State:
+        # Audited state field (changes over time)
+        rating = models.IntegerField()
+
+    class Meta:
+        abstract = True
+
+# BlogArticle has no State of its own, it purely inherits 'rating'
+class BlogArticle(AbstractDocument):
+    url = models.URLField()  # Anchor field specific to BlogArticle
+
+# Book defines its own State, which is merged with the inherited State
+class Book(AbstractDocument):
+    isbn = models.CharField(max_length=20, unique=True)  # Anchor field specific to Book
+
+    class State:
+        price = models.DecimalField(max_digits=10, decimal_places=2)  # Own state
+```
+
+#### Enforced Constraints
+
+To maintain strict data integrity, guard against race conditions, and keep the system simple and robust, the following rules are strictly enforced:
+
+1. **Abstract Bases Only:** A model can only inherit audited state fields from an **abstract** base model. Attempting to inherit state from a concrete model raises a `RuntimeError`. Multi-level inheritance of audited states (e.g., an abstract model inheriting state from another abstract audited model) is also forbidden to keep schemas clean.
+2. **Single Inheritance Only:** Multiple inheritance of models with non-empty audited states is not supported. Attempting to inherit state from more than one audited model raises a `RuntimeError`.
+3. **Deterministic Column Ordering:** In the dynamically generated companion state table (e.g., `BookState`), the inherited fields are guaranteed to be defined first (e.g., `rating`), followed by the subclass's own fields (e.g., `price`).
+
