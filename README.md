@@ -232,3 +232,14 @@ To maintain strict data integrity, guard against race conditions, and keep the s
 2. **Single Inheritance Only:** Multiple inheritance of models with non-empty audited states is not supported. Attempting to inherit state from more than one audited model raises a `RuntimeError`.
 3. **Deterministic Column Ordering:** In the dynamically generated companion state table (e.g., `BookState`), the inherited fields are guaranteed to be defined first (e.g., `rating`), followed by the subclass's own fields (e.g., `price`).
 
+---
+
+## Unsupported Features
+
+- **`save(update_fields=...)`**: Passing `update_fields` to the `save()` method is explicitly not supported and will raise a `ValueError`.
+  - **Reasoning**: `django_audit_trail` works by creating a completely new row in the companion `State` table for every change to audited fields.
+    Because a new state row contains the full state of the object, partial updates via `update_fields` do not provide any performance benefit at the database level.
+    Furthermore, allowing partial updates introduces complex edge cases with in-memory dirty tracking and concurrent modifications,
+    which compromises the strict data integrity guarantees of the audit trail.
+  - **Consequence**: Because Django automatically uses `update_fields` when saving instances loaded via `only()` or `defer()`,
+    calling `save()` on a deferred instance will raise a `ValueError`. You must load the full object before saving.

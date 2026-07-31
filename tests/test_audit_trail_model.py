@@ -423,17 +423,12 @@ def test_save_failure_rolls_back_database(alice):
 
 
 @pytest.mark.django_db
-def test_update_fields_behavior(alice, bob):
+def test_update_fields_raises_value_error(alice):
     """
-    Ensure that save(update_fields=...) correctly filters anchor and state fields.
-    1. Saving only anchor fields (like owner) does not write a state row, and leaves pending state edits intact.
-    2. Saving only state fields (like title) writes a state row but does not persist unsaved anchor changes.
+    Ensure that save(update_fields=...) raises a ValueError.
     """
     event_create = Event.objects.create(user=alice, comment="PR creation")
-    event_update1 = Event.objects.create(user=bob, comment="Update anchor only")
-    event_update2 = Event.objects.create(user=bob, comment="Update state only")
 
-    # 1. Create original PR
     with audit_trail_event(event_create):
         pr = PullRequest.objects.create(
             owner="octocat",
@@ -442,38 +437,10 @@ def test_update_fields_behavior(alice, bob):
             title="Original Title",
         )
 
-    # 2. Modify both in memory: an anchor field (owner) and a state field (title)
     pr.owner = "new-owner"
-    pr.title = "Staged New Title"
-
-    # Save only the anchor field "owner"
-    with audit_trail_event(event_update1):
-        pr.save(update_fields=["owner"])
-
-    # DB Assertions:
-    # - Anchor field 'owner' should be updated
-    # - Companion state should NOT have been updated (still 1 state row in total)
-    # - Pending state edit 'title' is still intact in _draft_state_dirty_fields
-    pr_db = PullRequest.objects.get(pk=pr.pk)
-    assert pr_db.owner == "new-owner"
-    assert pr._state_model.all_objects.count() == 1
-    assert pr.title == "Staged New Title"
-
-    # 3. Now modify another anchor field in memory but save only "title"
-    pr.repo = "new-repo"
-
-    with audit_trail_event(event_update2):
-        pr.save(update_fields=["title"])
-
-    # DB Assertions:
-    # - Companion state should now be updated (total 2 states)
-    # - Pending state edit 'title' is cleared from _draft_state_dirty_fields
-    # - Anchor field 'repo' was NOT saved (should still be 'hello-world')
-    pr_db2 = PullRequest.objects.get(pk=pr.pk)
-    assert pr_db2.title == "Staged New Title"
-    assert pr_db2.repo == "hello-world"  # remains unchanged in DB
-    assert "title" not in pr._draft_state_dirty_fields
-    assert pr._state_model.all_objects.count() == 2
+    with pytest.raises(ValueError, match="update_fields is not supported by django_audit_trail"):
+        with audit_trail_event(event_create):
+            pr.save(update_fields=["owner"])
 
 
 @pytest.mark.django_db
@@ -725,8 +692,6 @@ def test_foreign_key_direct_id_assignment(alice, bob):
     1. Only the declared relation name (e.g. "user") is registered as a descriptor.
        Assigning the direct DB attribute (e.g. `obj.user_id = bob.id`) bypasses the descriptor,
        writes directly to `__dict__`, is not recorded in `_draft_state_dirty_fields`, and is completely ignored.
-    2. Furthermore, `save(update_fields=["user_id"])` does not map the attribute name to the relation,
-       causing the update to be ignored or fail.
     """
     event_initial = Event.objects.create(user=alice, comment="Initial")
     event_new = Event.objects.create(user=alice, comment="New Event")
@@ -887,10 +852,10 @@ def test_state_update_does_not_clobber_concurrent_anchor_field(alice, bob):
 @pytest.mark.django_db
 def test_combined_anchor_and_state_change_persists_both(alice, bob):
     """
-    Transparency: saving with no explicit update_fields persists BOTH a changed
-    anchor field and a changed state field, exactly like a normal Django model
-    save. Anchor dirty-tracking detects the changed anchor column and writes it
-    (alongside auto_now columns) without clobbering concurrent anchor updates.
+    Transparency: saving persists BOTH a changed anchor field and a changed
+    state field, exactly like a normal Django model save. Anchor dirty-tracking
+    detects the changed anchor column and writes it (alongside auto_now columns)
+    without clobbering concurrent anchor updates.
     """
     event1 = Event.objects.create(user=alice, comment="Initial")
     event2 = Event.objects.create(user=bob, comment="Combined update")
@@ -912,45 +877,6 @@ def test_combined_anchor_and_state_change_persists_both(alice, bob):
     pr_final = PullRequest.objects.get(pk=pr.pk)
     assert pr_final.owner == "changed-owner"
     assert pr_final.title == "Changed Title"
-
-
-@pytest.mark.django_db
-def test_partial_save_retains_unsaved_draft_changes(alice):
-    """
-    Ensure that saving with update_fields only clears the targeted state fields
-    from the draft dirty set and retains any other unsaved changes in the draft state.
-    """
-    event1 = Event.objects.create(user=alice, comment="Initial")
-    event2 = Event.objects.create(user=alice, comment="Partial Update")
-
-    with audit_trail_event(event1):
-        pr = PullRequest.objects.create(
-            owner="octocat",
-            repo="hello-world",
-            number=1,
-            title="Initial Title",
-            description="Initial Description",
-        )
-
-    # Modify both state fields in memory.
-    pr.title = "Staged New Title"
-    pr.description = "Staged New Description"
-
-    assert pr._draft_state_dirty_fields == {"title", "description"}
-
-    # Save only 'title'.
-    with audit_trail_event(event2):
-        pr.save(update_fields=["title"])
-
-    # DB verification: title should be updated, description should be unchanged in DB.
-    db_pr = PullRequest.objects.get(pk=pr.pk)
-    assert db_pr.title == "Staged New Title"
-    assert db_pr.description == "Initial Description"
-
-    # In-memory verification: description change must still be present and dirty.
-    assert pr.title == "Staged New Title"
-    assert pr.description == "Staged New Description"
-    assert pr._draft_state_dirty_fields == {"description"}
 
 
 @pytest.mark.django_db
