@@ -275,15 +275,15 @@ def test_update_anchor_only_field_does_not_create_new_state(alice, bob):
 def test_chronological_consistency_validation(alice, bob):
     """
     Ensure chronological checks prevent applying/saving a state row with an
-    event that has an older timestamp than the currently active state row.
+    event that has an older ID than the currently active state row.
     """
     from django.core.exceptions import ValidationError
     from django.utils import timezone
     from datetime import timedelta
 
     now = timezone.now()
-    event_new = Event.objects.create(user=alice, comment="New Event", timestamp=now)
     event_old = Event.objects.create(user=bob, comment="Old Event", timestamp=now - timedelta(days=1))
+    event_new = Event.objects.create(user=alice, comment="New Event", timestamp=now)
 
     # Create model in the newer event
     with audit_trail_event(event_new):
@@ -311,7 +311,7 @@ def test_delete_chronological_consistency_validation(alice, bob):
     """
     Ensure late-arriving deletions are blocked.
 
-    Calling delete() with an Event whose timestamp is older than the currently
+    Calling delete() with an Event whose ID is older than the currently
     active state's created_event ("late arrival") MUST raise a ValidationError
     and MUST NOT revoke the anchor.
     """
@@ -320,10 +320,10 @@ def test_delete_chronological_consistency_validation(alice, bob):
     from datetime import timedelta
 
     now = timezone.now()
-    event_new = Event.objects.create(user=alice, comment="New Event", timestamp=now)
     event_old = Event.objects.create(
         user=bob, comment="Old Event", timestamp=now - timedelta(days=1)
     )
+    event_new = Event.objects.create(user=alice, comment="New Event", timestamp=now)
 
     # Create the model within the newer event.
     with audit_trail_event(event_new):
