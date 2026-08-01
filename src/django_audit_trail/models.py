@@ -359,7 +359,7 @@ def _assert_event_not_stale(loaded_state, event):
 
     Raises a `ValidationError` if the event is older than the latest event in the history timeline.
     """
-    if loaded_state is not None and event.timestamp < loaded_state.created_event.timestamp:
+    if loaded_state is not None and event.id < loaded_state.created_event.id:
         raise ValidationError(
             f"Chronological consistency error: Cannot apply event {event.id} "
             f"({event.timestamp}) because a newer state from event "
